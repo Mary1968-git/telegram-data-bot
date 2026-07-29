@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+Data-Analyst Telegram Bot (TDS Project 1) — built to the TA guide.
+
+Architecture (one process):
+  FastAPI app  -> GET /health     (keep-alive + sanity)
+               -> GET /run.jsonl  (public agent log; also /logs/<id>.jsonl)
+  bg thread    -> Telegram getUpdates long-poll loop
+                    per message: agent loop -> sendMessage(one JSON object)
+  bg thread    -> self-ping /health every 10 min (free hosts idle out)
+
+Reply contract: EVERY message gets exactly one JSON object and nothing else:
+    {"answer": <shaped exactly as asked>, "log_url": "<BASE_URL>/run.jsonl"}
+
+Env:
+  BOT_TOKEN        - from @BotFather
+  OPENAI_API_KEY   - LLM (OpenAI-compatible). Use a direct key (no weekly expiry).
+  OPENAI_BASE_URL  - optional, default https://api.openai.com/v1
+  LLM_MODEL        - default gpt-4o  (guide: mini gets stats wrong)
+  BASE_URL         - your public host, e.g. https://<service>.onrender.com
+  PORT             - provided by host
+"""
+import os, re, json, time, threading, traceback, subprocess, sys
+from collections import defaultdict, deque
+from pathlib import Path
+
+import requests
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
+
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+OPENAI_KEY  = os.environ["OPENAI_API_KEY"]
+OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_MODEL   = os.environ.get("LLM_MODEL", "gpt-4o")
+BASE_URL    = os.environ.get("BASE_URL", "").rstrip("/")
+PORT        = int(os.environ.get("PORT", "8080"))
+
+TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
+LOG_PATH = Path("run.jsonl")           # single rolling public log (guide: /run.jsonl)
+LOG_LOCK = threading.Lock()
+HISTORY  = defaultdict(lambda: deque(maxlen=20))   # per chat_id, last ~20 turns
+WALL_BUDGET = 210                       # seconds; late perfect answer scores zero
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/run.jsonl")
+def run_log():
+    if LOG_PATH.exists():
+        return FileResponse(str(LOG_PATH), media_type="application/x-ndjson")
+    return PlainTextResponse("", media_type="application/x-ndjson")
+
+def logline(**kw):
+    kw["ts"] = time.time()
+    with LOG_LOCK:
+        with open(LOG_PATH, "a") as f:
+            f.write(json.dumps(kw, default=str) + "\n")
+
+# ---------------- tool: run_python ----------------
+def run_python(code: str) -> str:
+    try:
+        p = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=120)
+        out = p.stdout
+        if p.stderr:
+            out += "\n[stderr]\n" + p.stderr
+        return out[-8000:]              # cap last 8000 chars (guide)
+    except subprocess.TimeoutExpired:
+        return "ERROR: run_python timed out"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": ("Execute Python server-side and return stdout. "
+                        "pandas, numpy, requests, bs4, openpyxl are available. "
+                        "Use it to download & analyse public datasets (MOSPI XLSX/CSV/HTML). print() results."),
+        "parameters": {"type": "object",
+                       "properties": {"code": {"type": "string"}},
+                       "required": ["code"]},
+    }
+}]
+
+SYSTEM = """You are a data-analyst agent answering ONE data-analysis question over Telegram.
+
+Rules:
+1. Answer the LATEST user message. Earlier messages are context (multi-turn).
+2. Use the run_python tool to fetch/compute — never guess a number you can compute.
+   Datasets are public (MOSPI publishes XLSX/CSV/HTML). If fetching genuinely fails,
+   answer from well-established knowledge.
+3. Output ONLY the JSON object the question asks for — no prose, no markdown fences.
+   Put the placeholder "LOG_URL_PLACEHOLDER" as the log_url value; code substitutes the real URL.
+4. Match the requested answer shape EXACTLY (keys, nesting, string vs number). Never add extra keys.
+5. If a message is only setup ("I'll send data next"), still reply with a small JSON ack
+   like {"answer": "ready", "log_url": "LOG_URL_PLACEHOLDER"}.
+
+When finished, emit ONLY the final JSON object on the last line."""
+
+def call_llm(messages, tools=True):
+    body = {"model": LLM_MODEL, "messages": messages, "temperature": 0}
+    if tools:
+        body["tools"] = TOOLS
+    r = requests.post(f"{OPENAI_BASE}/chat/completions",
+                      headers={"Authorization": f"Bearer {OPENAI_KEY}",
+                               "Content-Type": "application/json"},
+                      json=body, timeout=120)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]
+
+def extract_json(text: str):
+    """Strip fences, find the first balanced {...}, json.loads it."""
+    if not text:
+        return None
+    t = re.sub(r"```(?:json)?", "", text).strip()
+    start = t.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(t)):
+            if t[i] == "{": depth += 1
+            elif t[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(t[start:i+1])
+                    except json.JSONDecodeError:
+                        break
+        start = t.find("{", start + 1)
+    return None
+
+def agent(chat_id: int, deadline: float):
+    """Run the agent loop over this chat's history; return the reply dict."""
+    log_url = f"{BASE_URL}/run.jsonl"
+    messages = [{"role": "system", "content": SYSTEM}]
+    messages += list(HISTORY[chat_id])            # includes latest user turn
+    for step in range(10):                         # cap ~10 steps
+        tools_on = time.time() < deadline          # past budget -> force answer
+        try:
+            msg = call_llm(messages, tools=tools_on)
+        except Exception as e:
+            logline(event="llm_error", chat_id=chat_id, error=str(e))
+            return {"answer": "internal error", "log_url": log_url}
+        messages.append(msg)
+        logline(event="assistant", chat_id=chat_id,
+                content=msg.get("content"), tool_calls=msg.get("tool_calls"))
+        tcs = msg.get("tool_calls")
+        if tcs and tools_on:
+            for tc in tcs:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+                logline(event="tool_call", chat_id=chat_id, args=args)
+                out = run_python(args.get("code", ""))
+                logline(event="tool_result", chat_id=chat_id, result=out[:4000])
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+            continue
+        # model produced text -> extract JSON
+        parsed = extract_json(msg.get("content") or "")
+        if parsed is not None:
+            if "answer" not in parsed:
+                parsed = {"answer": parsed}       # wrap if no 'answer' key
+            parsed["log_url"] = log_url            # always overwrite with real URL
+            return parsed
+        # nudge to finalize
+        messages.append({"role": "user",
+                         "content": "Reply now with ONLY the JSON object the question asked for."})
+    return {"answer": "internal error", "log_url": log_url}
+
+def handle_message(chat_id: int, text: str):
+    logline(event="question", chat_id=chat_id, text=text)
+    HISTORY[chat_id].append({"role": "user", "content": text})
+    deadline = time.time() + WALL_BUDGET
+    try:
+        reply = agent(chat_id, deadline)
+    except Exception as e:
+        logline(event="handler_error", chat_id=chat_id, error=str(e), tb=traceback.format_exc())
+        reply = {"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"}
+    HISTORY[chat_id].append({"role": "assistant", "content": json.dumps(reply)})
+    body = json.dumps(reply)
+    logline(event="reply", chat_id=chat_id, body=body)
+    requests.post(f"{TG}/sendMessage", json={"chat_id": chat_id, "text": body}, timeout=30)
+
+# ---------------- telegram long-poll loop ----------------
+def poll_loop():
+    offset = None
+    # clear webhook so getUpdates works
+    try: requests.get(f"{TG}/deleteWebhook", timeout=15)
+    except Exception: pass
+    while True:
+        try:
+            params = {"timeout": 50}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(f"{TG}/getUpdates", params=params, timeout=60)
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg or "text" not in msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                text = msg["text"]
+                threading.Thread(target=handle_message, args=(chat_id, text), daemon=True).start()
+        except Exception as e:
+            logline(event="poll_error", error=str(e))
+            time.sleep(3)
+
+# ---------------- self keep-alive ----------------
+def keepalive_loop():
+    if not BASE_URL:
+        return
+    while True:
+        time.sleep(600)  # 10 min
+        try: requests.get(f"{BASE_URL}/health", timeout=20)
+        except Exception: pass
+
+@app.on_event("startup")
+def startup():
+    threading.Thread(target=poll_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
+    logline(event="startup", model=LLM_MODEL, base_url=BASE_URL)
