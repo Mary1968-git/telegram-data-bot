@@ -60,7 +60,26 @@ def logline(**kw):
             f.write(json.dumps(kw, default=str) + "\n")
 
 # ---------------- tool: run_python ----------------
+_INSTALLED = set()
+def _ensure(pkgs):
+    """Best-effort runtime install of analysis libs (kept out of build for speed)."""
+    for p in pkgs:
+        if p in _INSTALLED:
+            continue
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", p],
+                           timeout=180, capture_output=True)
+        except Exception:
+            pass
+        _INSTALLED.add(p)
+
 def run_python(code: str) -> str:
+    # Preinstall common libs the first time they appear in code.
+    want = [pkg for pkg, mod in [("pandas","pandas"),("numpy","numpy"),
+            ("beautifulsoup4","bs4"),("lxml","lxml"),("openpyxl","openpyxl")]
+            if mod in code]
+    if want:
+        _ensure(want)
     try:
         p = subprocess.run([sys.executable, "-c", code],
                            capture_output=True, text=True, timeout=120)
