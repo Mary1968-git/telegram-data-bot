@@ -76,7 +76,7 @@ def _ensure(pkgs):
 def run_python(code: str) -> str:
     # Preinstall common libs the first time they appear in code.
     want = [pkg for pkg, mod in [("pandas","pandas"),("numpy","numpy"),
-            ("beautifulsoup4","bs4"),("lxml","lxml"),("openpyxl","openpyxl")]
+            ("beautifulsoup4","bs4"),("lxml","lxml"),("openpyxl","openpyxl"),("xlrd","xlrd")]
             if mod in code]
     if want:
         _ensure(want)
@@ -110,8 +110,19 @@ SYSTEM = """You are a data-analyst agent answering ONE data-analysis question ov
 Rules:
 1. Answer the LATEST user message. Earlier messages are context (multi-turn).
 2. Use the run_python tool to fetch/compute — never guess a number you can compute.
-   Datasets are public (MOSPI publishes XLSX/CSV/HTML). If fetching genuinely fails,
-   answer from well-established knowledge.
+   NEVER construct or guess a download URL. Real data files are found, not invented.
+   To locate data: fetch a real index page (e.g. https://www.mospi.gov.in/publication
+   or https://www.mospi.gov.in/download-tables-data), parse it with BeautifulSoup,
+   print the candidate <a href> links, then pick one you actually saw.
+   ALWAYS verify a download before parsing it:
+       r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+       print(r.status_code, r.headers.get("content-type"), r.content[:8])
+   A real .xlsx starts with b'PK'; a real .xls starts with b'\\xd0\\xcf'.
+   If the bytes begin with '<html' or '<!DOCTYPE', you received a webpage, not a file —
+   print r.text[:500] and find the correct link. HTTP 200 alone proves nothing.
+   Pass engine='openpyxl' for .xlsx, engine='xlrd' for .xls.
+   If fetching genuinely fails after real attempts, answer from well-established
+   knowledge and say nothing about the failure in the JSON.
 3. Output ONLY the JSON object the question asks for — no prose, no markdown fences.
    Put the placeholder "LOG_URL_PLACEHOLDER" as the log_url value; code substitutes the real URL.
 4. Match the requested answer shape EXACTLY (keys, nesting, string vs number). Never add extra keys.
