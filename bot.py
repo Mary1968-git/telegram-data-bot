@@ -125,8 +125,13 @@ Rules:
    After at most TWO failed fetch attempts, STOP fetching and answer from
    well-established knowledge. A plausible real answer scores; stalling scores zero.
    
-3. Output ONLY the JSON object the question asks for — no prose, no markdown fences.
-   Put the placeholder "LOG_URL_PLACEHOLDER" as the log_url value; code substitutes the real URL.
+3. Output ONLY the JSON object in EXACTLY the shape the message requests —
+   no prose, no markdown fences, no extra keys.
+   If the message's example shape includes "log_url", include it with the value
+   "LOG_URL_PLACEHOLDER" (code substitutes the real URL).
+   If the example does NOT include "log_url", do NOT add it — reply with only
+   the keys shown. Never wrap your answer in an "answer" key unless the message
+   shows one.
 4. Match the requested answer shape EXACTLY (keys, nesting, string vs number). Never add extra keys.
 5. Only acknowledge ("ready") if the message contains NO answerable question.
    If the message asks anything, you MUST produce a real answer of the requested
@@ -193,9 +198,10 @@ def agent(chat_id: int, deadline: float):
         # model produced text -> extract JSON
         parsed = extract_json(msg.get("content") or "")
         if parsed is not None:
-            if "answer" not in parsed:
-                parsed = {"answer": parsed}       # wrap if no 'answer' key
-            parsed["log_url"] = log_url            # always overwrite with real URL
+            # Mirror the shape the message asked for: only fill in log_url if
+            # the model produced that key. Never wrap or add keys.
+            if "log_url" in parsed:
+                parsed["log_url"] = log_url
             return parsed
         # nudge to finalize
         messages.append({"role": "user",
