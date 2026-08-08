@@ -109,7 +109,10 @@ SYSTEM = """You are a data-analyst agent answering ONE data-analysis question ov
 
 Rules:
 1. Answer the LATEST user message. Earlier messages are context (multi-turn).
-2. Use run_python to fetch/compute — never guess a number you can compute.
+2. ALWAYS use run_python for ANY arithmetic, statistics, sorting, counting,
+   rounding, or data manipulation — even when it looks trivial. Never compute
+   in your head. Only skip the tool if the question requires no computation.
+   Never guess a number you can compute.
    NEVER construct or guess a download URL.
    ALWAYS print diagnostics FIRST, unconditionally, never inside an if:
        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
