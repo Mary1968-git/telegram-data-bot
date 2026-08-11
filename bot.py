@@ -134,7 +134,8 @@ Rules:
    "LOG_URL_PLACEHOLDER" (code substitutes the real URL).
    If the example does NOT include "log_url", do NOT add it — reply with only
    the keys shown. Never wrap your answer in an "answer" key unless the message
-   shows one.
+   shows one.Always use the literal string "LOG_URL_PLACEHOLDER" for any log_url value,
+   at whatever nesting level the message shows it.
 4. Match the requested answer shape EXACTLY (keys, nesting, string vs number). Never add extra keys.
 5. Only acknowledge ("ready") if the message contains NO answerable question.
    If the message asks anything, you MUST produce a real answer of the requested
@@ -203,8 +204,14 @@ def agent(chat_id: int, deadline: float):
         if parsed is not None:
             # Mirror the shape the message asked for: only fill in log_url if
             # the model produced that key. Never wrap or add keys.
-            if "log_url" in parsed:
-                parsed["log_url"] = log_url
+            def _fill(o):
+                if isinstance(o, dict):
+                    return {k: (log_url if k == "log_url" else _fill(v))
+                            for k, v in o.items()}
+                if isinstance(o, list):
+                    return [_fill(v) for v in o]
+                return o
+            parsed = _fill(parsed)
             return parsed
         # nudge to finalize
         messages.append({"role": "user",
