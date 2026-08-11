@@ -113,6 +113,9 @@ Rules:
    rounding, or data manipulation — even when it looks trivial. Never compute
    in your head. Only skip the tool if the question requires no computation.
    Never guess a number you can compute.
+   ALWAYS end your code with print(...) — a bare expression prints nothing and
+   returns an empty result. If a tool result comes back empty, you forgot print();
+   re-run the same computation with print() rather than answering from memory.
    NEVER construct or guess a download URL.
    ALWAYS print diagnostics FIRST, unconditionally, never inside an if:
        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
